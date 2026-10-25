@@ -6,6 +6,8 @@ using System.Text;
 using System.Text.Json;
 using System.Runtime.InteropServices;
 using System.Threading.Tasks;
+using System.Collections.Concurrent;
+using System.Text.Json.Serialization;
 
 internal static class Program
 {
@@ -19,47 +21,82 @@ internal static class Program
 
 public class Conta
 {
+    public int Id { get; set; }
     public string Nome { get; set; } = "";
     public string Usuario { get; set; } = "";
     public string Senha { get; set; } = "";
     public string Descricao { get; set; } = "";
 }
 
-public static class Cofre
+public class RespostaEsp32
 {
-    private static readonly string Pasta =
-        Path.Combine(Environment.GetFolderPath(
-            Environment.SpecialFolder.LocalApplicationData), "Nexus");
+    public string? tipo { get; set; }
+    public bool ok { get; set; }
+    public string? erro { get; set; }
+    public int id { get; set; }
+    public List<Conta>? contas { get; set; }
+    public Conta? conta { get; set; }
+    public string? mensagem { get; set; }
+}
 
-    private static readonly string Arquivo =
-        Path.Combine(Pasta, "cofre.dat");
-
-    public static List<Conta> Carregar()
+public static class CofreEsp32
+{
+    private static readonly JsonSerializerOptions Opcoes = new()
     {
-        Directory.CreateDirectory(Pasta);
+        PropertyNameCaseInsensitive = true
+    };
 
-        if (!File.Exists(Arquivo))
-            return new List<Conta>();
-
-        byte[] protegido = File.ReadAllBytes(Arquivo);
-        byte[] dados = ProtectedData.Unprotect(
-            protegido, null, DataProtectionScope.CurrentUser);
-
-        return JsonSerializer.Deserialize<List<Conta>>(dados)
-               ?? new List<Conta>();
-    }
-
-    public static void Salvar(List<Conta> contas)
+    public static RespostaEsp32 Enviar(
+        SerialPort serial,
+        object pedido,
+        Action<string>? tratarBotao = null)
     {
-        Directory.CreateDirectory(Pasta);
+        if (!serial.IsOpen)
+            throw new InvalidOperationException(
+                "ESP32 desconectado.");
 
-        byte[] dados = JsonSerializer.SerializeToUtf8Bytes(contas);
-        byte[] protegido = ProtectedData.Protect(
-            dados, null, DataProtectionScope.CurrentUser);
+        string json = JsonSerializer.Serialize(pedido);
 
-        string temporario = Arquivo + ".tmp";
-        File.WriteAllBytes(temporario, protegido);
-        File.Move(temporario, Arquivo, true);
+        serial.WriteLine(json);
+
+        var limite = DateTime.UtcNow.AddSeconds(3);
+
+        while (DateTime.UtcNow < limite)
+        {
+            string linha;
+
+            try
+            {
+                linha = serial.ReadLine().Trim();
+            }
+            catch (TimeoutException)
+            {
+                continue;
+            }
+
+            if (linha == "NAVEGAR" || linha == "SELECIONAR")
+            {
+                tratarBotao?.Invoke(linha);
+                continue;
+            }
+
+            try
+            {
+                var resposta =
+                    JsonSerializer.Deserialize<RespostaEsp32>(
+                        linha, Opcoes);
+
+                if (resposta?.tipo == "RESPOSTA")
+                    return resposta;
+            }
+            catch (JsonException)
+            {
+                // Ignora mensagens que não sejam respostas JSON.
+            }
+        }
+
+        throw new TimeoutException(
+            "O ESP32 não respondeu ao comando.");
     }
 }
 
@@ -69,7 +106,7 @@ public class OverlayForm : Form
     private readonly SerialPort serial = new("COM5", 115200);
     private readonly System.Windows.Forms.Timer timer = new();
     private List<Conta> contas = new();
-
+    private bool inicializando;
     private readonly Panel barraTopo = new();
     private readonly Label titulo = new();
     private readonly Label subtitulo = new();
@@ -166,6 +203,92 @@ public class OverlayForm : Form
         public ushort wParamH;
     }
 
+    private void TratarBotaoDuranteComando(string comando)
+    {
+        if (comando == "NAVEGAR" && contas.Count > 0)
+        {
+            indice = (indice + 1) % contas.Count;
+            senhaVisivel = false;
+            AtualizarContas();
+        }
+        else if (comando == "SELECIONAR" && contas.Count > 0)
+        {
+            _ = PreencherSenha();
+        }
+    }
+
+    private bool RecarregarContas()
+    {
+        try
+        {
+            var resposta = EnviarComando(new { cmd = "LISTAR" });
+
+            if (!resposta.ok)
+            {
+                status.Text = "ERRO AO LISTAR CONTAS";
+                return false;
+            }
+
+            contas = resposta.contas ?? new List<Conta>();
+
+            indice = contas.Count == 0
+                ? 0
+                : Math.Clamp(indice, 0, contas.Count - 1);
+
+            senhaVisivel = false;
+            AtualizarContas();
+
+            status.Text = contas.Count > 0
+                ? "CONTAS CARREGADAS DO ESP32"
+                : "NENHUMA CONTA CADASTRADA";
+
+            return true;
+        }
+        catch (Exception ex)
+        {
+            status.Text = "ERRO AO LER O ESP32";
+
+            MessageBox.Show(
+                "Não foi possível carregar as contas:\n" + ex.Message,
+                "NEXUS",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Error);
+
+            return false;
+        }
+    }
+
+    private Conta ObterContaSelecionada()
+    {
+        if (!TemConta())
+            throw new InvalidOperationException(
+                "Nenhuma conta selecionada.");
+
+        var resposta = EnviarComando(new
+        {
+            cmd = "OBTER",
+            id = contas[indice].Id
+        });
+
+        if (!resposta.ok || resposta.conta == null)
+            throw new InvalidOperationException(
+                resposta.erro ?? "Não foi possível obter a conta.");
+
+        return resposta.conta;
+    }
+
+    private RespostaEsp32 EnviarComando(object pedido)
+    {
+        if (!serial.IsOpen)
+            throw new InvalidOperationException(
+                "O ESP32 não está conectado à COM5.");
+
+        return CofreEsp32.Enviar(
+            serial,
+            pedido,
+            TratarBotaoDuranteComando);
+    }
+
     public OverlayForm()
     {
         Size = new Size(360, 440);
@@ -180,17 +303,28 @@ public class OverlayForm : Form
 
         try
         {
-            contas = Cofre.Carregar();
+            serial.NewLine = "\n";
+            serial.ReadTimeout = 100;
+            serial.WriteTimeout = 1000;
+            serial.Open();
+
+            status.Text = "ESP32 CONECTADO • COM5";
+            status.ForeColor = Color.FromArgb(100, 220, 170);
+
+            serial.DiscardInBuffer();
+
+            RecarregarContas();
         }
         catch (Exception ex)
         {
+            status.Text = "ESP32 DESCONECTADO • COM5";
+            status.ForeColor = Color.FromArgb(255, 120, 130);
+
             MessageBox.Show(
-                "Não foi possível abrir o cofre:\n" + ex.Message,
+                "Erro ao conectar ao ESP32:\n" + ex.Message,
                 "NEXUS",
                 MessageBoxButtons.OK,
                 MessageBoxIcon.Error);
-
-            contas = new List<Conta>();
         }
 
         CriarInterface();
@@ -411,9 +545,43 @@ public class OverlayForm : Form
             if (conta == null)
                 return;
 
-            contas.Add(conta);
-            indice = contas.Count - 1;
-            SalvarCofre();
+            var resposta = EnviarComando(new
+            {
+                cmd = "CRIAR",
+                conta = new
+                {
+                    nome = conta.Nome,
+                    usuario = conta.Usuario,
+                    senha = conta.Senha,
+                    descricao = conta.Descricao
+                }
+            });
+
+            if (!resposta.ok)
+                throw new InvalidOperationException(
+                    resposta.erro ?? "Não foi possível criar a conta.");
+
+            if (resposta.id > 0)
+                conta.Id = resposta.id;
+
+            if (RecarregarContas())
+            {
+                indice = contas.FindIndex(c => c.Id == conta.Id);
+                if (indice < 0)
+                    indice = Math.Max(0, contas.Count - 1);
+
+                AtualizarContas();
+                status.Text = "CONTA SALVA NO ESP32";
+                status.ForeColor = Color.FromArgb(100, 220, 170);
+            }
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show(
+                "Erro ao adicionar conta:\n" + ex.Message,
+                "NEXUS",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Error);
         }
         finally
         {
@@ -430,14 +598,53 @@ public class OverlayForm : Form
 
         try
         {
+            var original = ObterContaSelecionada();
+
             var alterada = EditarDialog.Mostrar(
-                this, contas[indice], fundo, painel, roxo, texto);
+                this, original, fundo, painel, roxo, texto);
 
             if (alterada == null)
                 return;
 
-            contas[indice] = alterada;
-            SalvarCofre();
+            var resposta = EnviarComando(new
+            {
+                cmd = "EDITAR",
+                id = original.Id,
+                conta = new
+                {
+                    nome = alterada.Nome,
+                    usuario = alterada.Usuario,
+                    senha = alterada.Senha,
+                    descricao = alterada.Descricao
+                }
+            });
+
+            if (!resposta.ok)
+                throw new InvalidOperationException(
+                    resposta.erro ?? "Não foi possível editar a conta.");
+
+            indice = contas.FindIndex(c => c.Id == original.Id);
+            if (indice < 0)
+                indice = 0;
+
+            if (RecarregarContas())
+            {
+                indice = contas.FindIndex(c => c.Id == original.Id);
+                if (indice < 0)
+                    indice = 0;
+
+                AtualizarContas();
+                status.Text = "ALTERAÇÕES SALVAS NO ESP32";
+                status.ForeColor = Color.FromArgb(100, 220, 170);
+            }
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show(
+                "Erro ao editar conta:\n" + ex.Message,
+                "NEXUS",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Error);
         }
         finally
         {
@@ -450,19 +657,47 @@ public class OverlayForm : Form
         if (!TemConta())
             return;
 
-        var resposta = MessageBox.Show(
-            $"Excluir a conta '{contas[indice].Nome}'?",
+        var conta = contas[indice];
+
+        var respostaConfirmacao = MessageBox.Show(
+            $"Excluir a conta '{conta.Nome}'?",
             "Confirmar exclusão",
             MessageBoxButtons.YesNo,
             MessageBoxIcon.Warning);
 
-        if (resposta != DialogResult.Yes)
+        if (respostaConfirmacao != DialogResult.Yes)
             return;
 
-        contas.RemoveAt(indice);
-        indice = Math.Max(0, indice - 1);
-        senhaVisivel = false;
-        SalvarCofre();
+        try
+        {
+            var resposta = EnviarComando(new
+            {
+                cmd = "EXCLUIR",
+                id = conta.Id
+            });
+
+            if (!resposta.ok)
+                throw new InvalidOperationException(
+                    resposta.erro ?? "Não foi possível excluir a conta.");
+
+            indice = Math.Max(0, indice - 1);
+
+            if (RecarregarContas())
+            {
+                senhaVisivel = false;
+                AtualizarContas();
+                status.Text = "CONTA EXCLUÍDA DO ESP32";
+                status.ForeColor = Color.FromArgb(100, 220, 170);
+            }
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show(
+                "Erro ao excluir conta:\n" + ex.Message,
+                "NEXUS",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Error);
+        }
     }
 
     private bool TemConta()
@@ -480,15 +715,28 @@ public class OverlayForm : Form
         if (!TemConta())
             return;
 
-        senhaVisivel = !senhaVisivel;
+        try
+        {
+            var conta = ObterContaSelecionada();
 
-        MessageBox.Show(
-            $"Conta: {contas[indice].Nome}\n" +
-            $"Usuário: {contas[indice].Usuario}\n" +
-            $"Senha: {(senhaVisivel ? contas[indice].Senha : "••••••••")}",
-            "Dados da conta",
-            MessageBoxButtons.OK,
-            MessageBoxIcon.Information);
+            senhaVisivel = !senhaVisivel;
+
+            MessageBox.Show(
+                $"Conta: {conta.Nome}\n" +
+                $"Usuário: {conta.Usuario}\n" +
+                $"Senha: {(senhaVisivel ? conta.Senha : "••••••••")}",
+                "Dados da conta",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Information);
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show(
+                "Erro ao consultar senha:\n" + ex.Message,
+                "NEXUS",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Error);
+        }
     }
 
     private void CopiarSenha()
@@ -498,36 +746,23 @@ public class OverlayForm : Form
 
         try
         {
-            Clipboard.SetText(contas[indice].Senha);
+            var conta = ObterContaSelecionada();
+
+            if (string.IsNullOrEmpty(conta.Senha))
+            {
+                status.Text = "A CONTA NÃO POSSUI SENHA";
+                return;
+            }
+
+            Clipboard.SetText(conta.Senha);
+
             status.Text = "SENHA COPIADA!";
             status.ForeColor = Color.FromArgb(100, 220, 170);
         }
         catch (Exception ex)
         {
-            status.Text = "ERRO AO COPIAR";
-
             MessageBox.Show(
-                ex.Message,
-                "NEXUS",
-                MessageBoxButtons.OK,
-                MessageBoxIcon.Error);
-        }
-    }
-
-    private void SalvarCofre()
-    {
-        try
-        {
-            Cofre.Salvar(contas);
-            AtualizarContas();
-
-            status.Text = "COFRE SALVO E PROTEGIDO";
-            status.ForeColor = Color.FromArgb(100, 220, 170);
-        }
-        catch (Exception ex)
-        {
-            MessageBox.Show(
-                "Erro ao salvar o cofre:\n" + ex.Message,
+                "Erro ao copiar senha:\n" + ex.Message,
                 "NEXUS",
                 MessageBoxButtons.OK,
                 MessageBoxIcon.Error);
@@ -586,7 +821,9 @@ public class OverlayForm : Form
 
         try
         {
-            string senha = contas[indice].Senha;
+            var conta = ObterContaSelecionada();
+            string senha = conta.Senha;
+
             IntPtr destino = janelaDestino;
 
             if (string.IsNullOrEmpty(senha))
