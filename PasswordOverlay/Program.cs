@@ -802,7 +802,7 @@ public class OverlayForm : Form
 
             var alterada = EditarDialog.Mostrar(
                 this, original, fundo, painel, roxo, texto);
-
+                
             if (alterada == null)
                 return;
 
