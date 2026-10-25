@@ -101,6 +101,155 @@ public static class CofreEsp32
 }
 
 
+
+public static class CriptografiaNexus
+{
+    private const string Prefixo = "NEXUS1:";
+    private const int TamanhoNonce = 12;
+    private const int TamanhoTag = 16;
+
+    private static readonly byte[] Entropia =
+        Encoding.UTF8.GetBytes("NEXUS-COFRE-CHAVE-V1");
+
+    private static readonly Lazy<byte[]> Chave =
+        new(CarregarOuCriarChave);
+
+    private static byte[] CarregarOuCriarChave()
+    {
+        string pasta = Path.Combine(
+            Environment.GetFolderPath(
+                Environment.SpecialFolder.ApplicationData),
+            "NEXUS");
+
+        Directory.CreateDirectory(pasta);
+
+        string caminho = Path.Combine(pasta, "chave.dpapi");
+
+        if (File.Exists(caminho))
+        {
+            return ProtectedData.Unprotect(
+                File.ReadAllBytes(caminho),
+                Entropia,
+                DataProtectionScope.CurrentUser);
+        }
+
+        byte[] chave = RandomNumberGenerator.GetBytes(32);
+
+        byte[] protegida = ProtectedData.Protect(
+            chave,
+            Entropia,
+            DataProtectionScope.CurrentUser);
+
+        File.WriteAllBytes(caminho, protegida);
+
+        return chave;
+    }
+
+    public static string CriptografarCampo(string? valor)
+    {
+        valor ??= "";
+
+        byte[] texto = Encoding.UTF8.GetBytes(valor);
+        byte[] nonce = RandomNumberGenerator.GetBytes(TamanhoNonce);
+        byte[] cifra = new byte[texto.Length];
+        byte[] tag = new byte[TamanhoTag];
+
+        using (var aes = new AesGcm(Chave.Value, TamanhoTag))
+        {
+            aes.Encrypt(nonce, texto, cifra, tag);
+        }
+
+        byte[] resultado = new byte[
+            nonce.Length + tag.Length + cifra.Length];
+
+        Buffer.BlockCopy(nonce, 0, resultado, 0, nonce.Length);
+
+        Buffer.BlockCopy(
+            tag, 0, resultado, nonce.Length, tag.Length);
+
+        Buffer.BlockCopy(
+            cifra, 0, resultado,
+            nonce.Length + tag.Length, cifra.Length);
+
+        return Prefixo + Convert.ToBase64String(resultado);
+    }
+
+    public static string DescriptografarCampo(string? valor)
+    {
+        if (string.IsNullOrEmpty(valor))
+            return "";
+
+        // Permite reconhecer registros antigos ainda em texto puro.
+        if (!valor.StartsWith(Prefixo, StringComparison.Ordinal))
+            return valor;
+
+        byte[] dados = Convert.FromBase64String(
+            valor[Prefixo.Length..]);
+
+        if (dados.Length < TamanhoNonce + TamanhoTag)
+        {
+            throw new CryptographicException(
+                "Dados criptografados inválidos.");
+        }
+
+        byte[] nonce = dados[..TamanhoNonce];
+
+        byte[] tag = dados[
+            TamanhoNonce..(TamanhoNonce + TamanhoTag)];
+
+        byte[] cifra = dados[
+            (TamanhoNonce + TamanhoTag)..];
+
+        byte[] texto = new byte[cifra.Length];
+
+        using (var aes = new AesGcm(Chave.Value, TamanhoTag))
+        {
+            aes.Decrypt(nonce, cifra, tag, texto);
+        }
+
+        return Encoding.UTF8.GetString(texto);
+    }
+
+    public static bool ContaEstaCriptografada(Conta conta)
+    {
+        return CampoCriptografado(conta.Nome)
+            && CampoCriptografado(conta.Usuario)
+            && CampoCriptografado(conta.Senha)
+            && CampoCriptografado(conta.Descricao);
+    }
+
+    private static bool CampoCriptografado(string? valor)
+    {
+        return valor != null &&
+            valor.StartsWith(Prefixo, StringComparison.Ordinal);
+    }
+
+    public static Conta DescriptografarConta(Conta conta)
+    {
+        return new Conta
+        {
+            Id = conta.Id,
+            Nome = DescriptografarCampo(conta.Nome),
+            Usuario = DescriptografarCampo(conta.Usuario),
+            Senha = DescriptografarCampo(conta.Senha),
+            Descricao = DescriptografarCampo(conta.Descricao)
+        };
+    }
+
+    public static object CriarPayload(Conta conta)
+    {
+        return new
+        {
+            nome = CriptografarCampo(conta.Nome),
+            usuario = CriptografarCampo(conta.Usuario),
+            senha = CriptografarCampo(conta.Senha),
+            descricao = CriptografarCampo(conta.Descricao)
+        };
+    }
+}
+
+
+
 public class OverlayForm : Form
 {
     private readonly SerialPort serial = new("COM5", 115200);
@@ -217,6 +366,7 @@ public class OverlayForm : Form
         }
     }
 
+
     private bool RecarregarContas()
     {
         try
@@ -229,7 +379,60 @@ public class OverlayForm : Form
                 return false;
             }
 
-            contas = resposta.contas ?? new List<Conta>();
+            var recebidas = resposta.contas ?? new List<Conta>();
+
+            // Valida e descriptografa os registros recebidos.
+            var decifradas = recebidas
+                .Select(CriptografiaNexus.DescriptografarConta)
+                .ToList();
+
+            bool precisaMigrar = recebidas.Any(
+                c => !CriptografiaNexus.ContaEstaCriptografada(c));
+
+            if (precisaMigrar)
+            {
+                foreach (var registro in recebidas)
+                {
+                    if (CriptografiaNexus.ContaEstaCriptografada(registro))
+                        continue;
+
+                    var conta = CriptografiaNexus.DescriptografarConta(
+                        registro);
+
+                    var migracao = EnviarComando(new
+                    {
+                        cmd = "EDITAR",
+                        id = registro.Id,
+                        conta = CriptografiaNexus.CriarPayload(conta)
+                    });
+
+                    if (!migracao.ok)
+                    {
+                        throw new InvalidOperationException(
+                            migracao.erro ??
+                            $"Não foi possível migrar a conta {registro.Id}.");
+                    }
+                }
+
+                // Confirma o conteúdo persistido depois da migração.
+                resposta = EnviarComando(new { cmd = "LISTAR" });
+
+                if (!resposta.ok)
+                {
+                    throw new InvalidOperationException(
+                        "Não foi possível verificar as contas migradas.");
+                }
+
+                recebidas = resposta.contas ?? new List<Conta>();
+
+                contas = recebidas
+                    .Select(CriptografiaNexus.DescriptografarConta)
+                    .ToList();
+            }
+            else
+            {
+                contas = decifradas;
+            }
 
             indice = contas.Count == 0
                 ? 0
@@ -258,6 +461,8 @@ public class OverlayForm : Form
         }
     }
 
+
+
     private Conta ObterContaSelecionada()
     {
         if (!TemConta())
@@ -274,7 +479,8 @@ public class OverlayForm : Form
             throw new InvalidOperationException(
                 resposta.erro ?? "Não foi possível obter a conta.");
 
-        return resposta.conta;
+        return CriptografiaNexus.DescriptografarConta(
+            resposta.conta); return resposta.conta;
     }
 
     private RespostaEsp32 EnviarComando(object pedido)
@@ -548,13 +754,7 @@ public class OverlayForm : Form
             var resposta = EnviarComando(new
             {
                 cmd = "CRIAR",
-                conta = new
-                {
-                    nome = conta.Nome,
-                    usuario = conta.Usuario,
-                    senha = conta.Senha,
-                    descricao = conta.Descricao
-                }
+                conta = CriptografiaNexus.CriarPayload(conta)
             });
 
             if (!resposta.ok)
@@ -610,13 +810,7 @@ public class OverlayForm : Form
             {
                 cmd = "EDITAR",
                 id = original.Id,
-                conta = new
-                {
-                    nome = alterada.Nome,
-                    usuario = alterada.Usuario,
-                    senha = alterada.Senha,
-                    descricao = alterada.Descricao
-                }
+                conta = CriptografiaNexus.CriarPayload(alterada)
             });
 
             if (!resposta.ok)
